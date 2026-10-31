@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -56,6 +57,13 @@ struct User {
 struct Profile {
     version: String,
 }
+
+#[derive(Deserialize)]
+struct ApiError {
+    message: String,
+}
+
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 
 pub fn normalize_url(value: &str) -> Result<String> {
     let url = Url::parse(value).context("MEMOS_URL must be an absolute HTTP or HTTPS URL")?;
@@ -141,6 +149,24 @@ impl HttpApi {
     fn require_success(response: Response) -> Result<Response> {
         let status = response.status();
         if !status.is_success() {
+            let mut body = Vec::new();
+            if response
+                .take((MAX_ERROR_BODY_BYTES + 1) as u64)
+                .read_to_end(&mut body)
+                .is_ok()
+                && body.len() <= MAX_ERROR_BODY_BYTES
+                && let Ok(error) = serde_json::from_slice::<ApiError>(&body)
+            {
+                let message: String = error
+                    .message
+                    .chars()
+                    .filter(|c| !c.is_control() || c.is_whitespace())
+                    .collect();
+                let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !message.is_empty() {
+                    bail!("Memos API returned HTTP {status}: {message}");
+                }
+            }
             bail!("Memos API returned HTTP {status}");
         }
         Ok(response)
@@ -216,11 +242,14 @@ impl MemoApi for HttpApi {
 
     fn get_memo(&self, name: &str) -> Result<Option<Memo>> {
         validate_name(name)?;
-        let response = self.send(self.client.get(self.url(name)))?;
+        let response = self
+            .send(self.client.get(self.url(name)))
+            .with_context(|| format!("Getting {name}"))?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let remote: RemoteMemo = Self::require_success(response)?
+        let remote: RemoteMemo = Self::require_success(response)
+            .with_context(|| format!("Getting {name}"))?
             .json()
             .context("Memos returned an invalid memo")?;
         Ok(Some(self.named_memo(remote, name)?))
@@ -228,23 +257,27 @@ impl MemoApi for HttpApi {
 
     fn create_memo(&self, id: &str, content: &str) -> Result<Memo> {
         validate_id(id)?;
-        let remote = self.read_json(
-            self.client
-                .post(self.url("memos"))
-                .query(&[("memoId", id)])
-                .json(&serde_json::json!({"content": content, "visibility": "PRIVATE"})),
-        )?;
+        let remote = self
+            .read_json(
+                self.client
+                    .post(self.url("memos"))
+                    .query(&[("memoId", id)])
+                    .json(&serde_json::json!({"content": content, "visibility": "PRIVATE"})),
+            )
+            .with_context(|| format!("Creating memos/{id}"))?;
         self.named_memo(remote, &format!("memos/{id}"))
     }
 
     fn update_memo(&self, name: &str, content: &str) -> Result<Memo> {
         validate_name(name)?;
-        let remote = self.read_json(
-            self.client
-                .patch(self.url(name))
-                .query(&[("updateMask", "content")])
-                .json(&serde_json::json!({"name": name, "content": content})),
-        )?;
+        let remote = self
+            .read_json(
+                self.client
+                    .patch(self.url(name))
+                    .query(&[("updateMask", "content")])
+                    .json(&serde_json::json!({"name": name, "content": content})),
+            )
+            .with_context(|| format!("Updating {name}"))?;
         self.named_memo(remote, name)
     }
 }
@@ -381,6 +414,75 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&requests[3].2).unwrap(),
             serde_json::json!({"content":"hello", "name":"memos/new-id"})
         );
+    }
+
+    #[test]
+    fn rejected_create_reports_server_message_without_request_credentials_or_content() {
+        let mut responses = initialization();
+        responses.push((400, serde_json::json!({"code":3, "message":"content too long (max 8192 characters)", "details":[]})));
+        with_server(responses, |url| {
+            let api = HttpApi::new(&url, "test-token").unwrap();
+            let error = api
+                .create_memo("test", "private note contents")
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("Creating memos/test"));
+            assert!(error.contains("HTTP 400"));
+            assert!(error.contains("content too long (max 8192 characters)"));
+            assert!(!error.contains("test-token"));
+            assert!(!error.contains("private note contents"));
+        });
+    }
+
+    #[test]
+    fn error_body_falls_back_to_status_for_html_invalid_json_and_oversized_payloads() {
+        let oversized = serde_json::json!({"message":"must not appear", "details":"x".repeat(MAX_ERROR_BODY_BYTES)}).to_string();
+        for body in [
+            "<html>private upstream response</html>".to_owned(),
+            "{broken JSON".to_owned(),
+            "{\"message\":42}".to_owned(),
+            "{\"details\":\"private upstream response\"}".to_owned(),
+            oversized,
+        ] {
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            let handle = thread::spawn(move || {
+                let request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                request
+                    .respond(Response::from_string(body).with_status_code(400))
+                    .unwrap();
+            });
+            let response = Client::new().get(url).send().unwrap();
+            let error = HttpApi::require_success(response).unwrap_err();
+            assert_eq!(error.to_string(), "Memos API returned HTTP 400 Bad Request");
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn get_and_update_include_operation_and_server_error() {
+        let mut responses = initialization();
+        responses.extend([
+            (403, serde_json::json!({"message":"permission denied"})),
+            (400, serde_json::json!({"message":"content too long"})),
+        ]);
+        with_server(responses, |url| {
+            let api = HttpApi::new(&url, "test-token").unwrap();
+            let get_error = format!("{:#}", api.get_memo("memos/test").unwrap_err());
+            assert!(get_error.contains("Getting memos/test"));
+            assert!(get_error.contains("permission denied"));
+            let update_error = format!(
+                "{:#}",
+                api.update_memo("memos/test", "private contents")
+                    .unwrap_err()
+            );
+            assert!(update_error.contains("Updating memos/test"));
+            assert!(update_error.contains("content too long"));
+            assert!(!update_error.contains("private contents"));
+        });
     }
 
     #[test]

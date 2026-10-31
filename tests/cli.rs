@@ -27,6 +27,7 @@ struct Database {
     fail_create_after_commit: bool,
     fail_update_after_commit: bool,
     fail_get: Option<String>,
+    create_content_limit: Option<usize>,
 }
 
 struct Instance {
@@ -191,8 +192,17 @@ fn respond(
         if body["visibility"] != "PRIVATE" || !body["content"].is_string() {
             return (400, json!({"message": "expected private Markdown memo"}));
         }
+        let content = body["content"].as_str().unwrap();
+        if let Some(limit) = db.create_content_limit
+            && content.len() > limit
+        {
+            return (
+                400,
+                json!({"code": 3, "message": format!("content too long (max {limit} characters)")}),
+            );
+        }
         let memo = TestMemo {
-            content: body["content"].as_str().unwrap().to_owned(),
+            content: content.to_owned(),
             state: "NORMAL",
         };
         let response = wire_memo(id, &memo);
@@ -427,6 +437,39 @@ fn new_notes_reuse_their_id_after_an_ambiguous_create_response() {
         db.memos.values().next().unwrap().content,
         "# New note\n\nCreated locally."
     );
+}
+
+#[test]
+fn oversized_unicode_notes_report_server_byte_limits_and_retry_without_losing_content() {
+    let server = Instance::new();
+    let local = TempDir::new().unwrap();
+    let path = local.path().join("data/dogs/note.md");
+    let body = format!("# Dogs 🐕\n\n{}", "🐕".repeat(2200));
+    assert!(body.chars().count() < 8192);
+    assert!(body.len() > 8192);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, &body).unwrap();
+    server.db.lock().unwrap().create_content_limit = Some(8192);
+
+    let output = server.sync(&local, 1);
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("content too long (max 8192 characters)"));
+    let after_failure = fs::read_to_string(&path).unwrap();
+    assert!(after_failure.contains("memos_id:"));
+    assert_eq!(content(&path), body);
+    {
+        let db = server.db.lock().unwrap();
+        assert_eq!(db.creates, 0);
+        assert!(db.memos.is_empty());
+    }
+
+    server.db.lock().unwrap().create_content_limit = Some(65536);
+    server.sync(&local, 0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), after_failure);
+    let db = server.db.lock().unwrap();
+    assert_eq!(db.creates, 1);
+    assert_eq!(db.memos.len(), 1);
+    assert_eq!(db.memos.values().next().unwrap().content, body);
 }
 
 #[test]
