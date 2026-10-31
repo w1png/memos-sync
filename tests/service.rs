@@ -143,7 +143,14 @@ fn install_is_idempotent_preserves_cron_and_quotes_private_configuration() {
     let fixture = Fixture::new();
     let unrelated = "MAILTO=owner@example.com\n# Existing job\n12 3 * * * /usr/bin/true\n";
     fs::write(&fixture.cron, unrelated).unwrap();
-    let output = fixture.run("install");
+    let output = fixture
+        .command("install")
+        .env("MEMOS_URL", "invalid-process-url")
+        .env("TOKEN", "wrong-process-token")
+        .env("DATA_PATH", "/process/path/must/not/be/used")
+        .output()
+        .unwrap();
+    assert_success(&output);
     let installed = fixture.cron();
     assert!(installed.starts_with(unrelated));
     assert_eq!(installed.matches(BEGIN).count(), 1);
@@ -174,24 +181,33 @@ fn install_is_idempotent_preserves_cron_and_quotes_private_configuration() {
     assert!(script.contains(" sync"));
     assert!(script.contains(env!("CARGO_BIN_EXE_memos")));
 
-    // Evaluate only the environment assignments, never the real sync invocation.
-    let mut setup = script
+    assert!(!script.lines().any(|line| line.starts_with("export ")));
+    // Parse the quoted invocation into shell arguments without executing the binary.
+    let invocation = script
         .lines()
-        .filter(|line| line.starts_with("export "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    setup.push_str("\nprintf '%s\\n' \"$MEMOS_URL\" \"$TOKEN\" \"$DATA_PATH\"\n");
-    let environment = Command::new("/bin/sh")
+        .find_map(|line| line.strip_prefix("exec "))
+        .unwrap()
+        .split_once(" >> ")
+        .unwrap()
+        .0;
+    let setup = format!("set -- {invocation}\nprintf '%s\\n' \"$@\"\n");
+    let arguments = Command::new("/bin/sh")
         .arg("-c")
         .arg(setup)
         .output()
         .unwrap();
-    assert_success(&environment);
-    let values = String::from_utf8(environment.stdout).unwrap();
+    assert_success(&arguments);
+    let values = String::from_utf8(arguments.stdout).unwrap();
     let values: Vec<_> = values.lines().collect();
-    assert_eq!(values[0], "https://example.invalid");
-    assert_eq!(values[1], fixture.token);
-    assert_eq!(Path::new(values[2]), fixture.work.join("notes space"));
+    assert_eq!(values.len(), 5);
+    assert_eq!(values[0], env!("CARGO_BIN_EXE_memos"));
+    assert_eq!(values[1], "sync");
+    assert_eq!(values[2], "--url=https://example.invalid");
+    assert_eq!(values[3], format!("--token={}", fixture.token));
+    assert_eq!(
+        Path::new(values[4].strip_prefix("--data-path=").unwrap()),
+        fixture.work.join("notes space")
+    );
     assert!(
         !fixture.marker.exists(),
         "configuration was evaluated as shell code"
@@ -315,4 +331,27 @@ fn default_state_directory_uses_home_and_empty_crontabs_are_supported() {
     );
     assert!(!script.exists());
     assert!(fixture.cron().trim().is_empty());
+}
+
+#[test]
+fn service_install_requires_valid_dotenv_even_with_valid_process_configuration() {
+    let fixture = Fixture::new();
+    let original = "0 0 * * * /usr/bin/true\n";
+    fs::write(&fixture.cron, original).unwrap();
+    fs::remove_file(fixture.work.join(".env")).unwrap();
+    for dotenv in [None, Some("TOKEN=\"unterminated\n")] {
+        if let Some(dotenv) = dotenv {
+            fs::write(fixture.work.join(".env"), dotenv).unwrap();
+        }
+        let output = fixture
+            .command("install")
+            .env("MEMOS_URL", "https://valid.example.invalid")
+            .env("TOKEN", "valid-process-token")
+            .env("DATA_PATH", "./valid-process-data")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(fixture.cron(), original);
+        assert!(!fixture.script().exists());
+    }
 }

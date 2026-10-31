@@ -26,12 +26,7 @@ pub fn execute(command: ServiceCommand) -> Result<i32> {
     match command {
         ServiceCommand::Install { schedule } => {
             let schedule = validate_schedule(&schedule)?;
-            match dotenvy::from_path(".env") {
-                Ok(_) => {}
-                Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("Cannot load .env"),
-            }
-            let config = Config::from_env()?;
+            let config = Config::from_dotenv(Path::new(".env"))?;
             let cwd = std::env::current_dir()?;
             let data = if config.data_path.is_absolute() {
                 config.data_path.clone()
@@ -204,12 +199,12 @@ fn cron_path(path: &Path) -> Result<String> {
 
 fn wrapper(config: &Config, data: &Path, executable: &Path, state: &Path) -> Result<String> {
     Ok(format!(
-        "#!/bin/sh\n# Managed by memos service install. Contains credentials; keep private.\numask 077\nexport MEMOS_URL={}\nexport TOKEN={}\nexport DATA_PATH={}\ncd {} || exit 1\nexec {} sync >> {} 2>&1\n",
+        "#!/bin/sh\n# Managed by memos service install. Contains credentials; keep private.\numask 077\ncd {} || exit 1\nexec {} sync --url={} --token={} --data-path={} >> {} 2>&1\n",
+        quote(path_text(state)?),
+        quote(path_text(executable)?),
         quote(&config.url),
         quote(&config.token),
         quote(path_text(data)?),
-        quote(path_text(state)?),
-        quote(path_text(executable)?),
         quote(path_text(&state.join("sync.log"))?),
     ))
 }
@@ -531,7 +526,7 @@ mod tests {
     fn wrapper_quotes_credentials_and_paths_as_literal_shell_strings() {
         let config = Config {
             url: "https://example.com".into(),
-            token: "abc'$(touch /tmp/never)$HOME".into(),
+            token: "-abc'$(touch /tmp/never)$HOME".into(),
             data_path: "unused".into(),
         };
         let script = wrapper(
@@ -541,12 +536,14 @@ mod tests {
             Path::new("/home/me/state"),
         )
         .unwrap();
-        assert!(script.contains("export TOKEN='abc'\\''$(touch /tmp/never)$HOME'"));
-        assert!(script.contains("export DATA_PATH='/home/me/my notes'"));
+        assert!(script.contains("--token='-abc'\\''$(touch /tmp/never)$HOME'"));
+        assert!(script.contains("--data-path='/home/me/my notes'"));
+        assert!(!script.contains("export "));
         assert!(script.contains("cd '/home/me/state' || exit 1"));
         assert!(
-            script.ends_with("exec '/home/me/bin/memos' sync >> '/home/me/state/sync.log' 2>&1\n")
+            script.contains("exec '/home/me/bin/memos' sync --url='https://example.com' --token=")
         );
+        assert!(script.ends_with(" >> '/home/me/state/sync.log' 2>&1\n"));
         assert_eq!(
             cron_path(Path::new("/home/me/100% ready/sync.sh")).unwrap(),
             "'/home/me/100\\% ready/sync.sh'"

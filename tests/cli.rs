@@ -607,3 +607,134 @@ fn help_works_without_configuration_and_run_is_rejected() {
     assert_eq!(rejected.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("unrecognized subcommand"));
 }
+
+fn command_without_config(local: &TempDir) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memos"));
+    command
+        .arg("sync")
+        .current_dir(local.path())
+        .env_remove("MEMOS_URL")
+        .env_remove("TOKEN")
+        .env_remove("DATA_PATH");
+    command
+}
+
+fn assert_sync_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn explicit_configuration_works_without_environment_or_a_valid_dotenv() {
+    let server = Instance::new();
+    let local = TempDir::new().unwrap();
+    server.put("flags", "configured explicitly");
+    let data = local.path().join("explicit-data");
+    for dotenv in [None, Some("MEMOS_URL=\"unterminated\n")] {
+        if let Some(dotenv) = dotenv {
+            fs::write(local.path().join(".env"), dotenv).unwrap();
+        }
+        let output = command_without_config(&local)
+            .arg(format!("--url={}", server.url))
+            .arg("--token=test-token")
+            .arg(format!("--data-path={}", data.display()))
+            .output()
+            .unwrap();
+        assert_sync_success(&output);
+        let downloaded = notes(&data);
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(content(&downloaded[0]), "configured explicitly");
+    }
+}
+
+#[test]
+fn explicit_flags_override_conflicting_environment_and_dotenv_values() {
+    let server = Instance::new();
+    let local = TempDir::new().unwrap();
+    server.put("precedence", "correct server selected");
+    fs::write(
+        local.path().join(".env"),
+        "MEMOS_URL=invalid-dotenv-url\nTOKEN=wrong-dotenv-token\nDATA_PATH=wrong-dotenv-data\n",
+    )
+    .unwrap();
+    let data = local.path().join("selected-data");
+    let output = command_without_config(&local)
+        .env("MEMOS_URL", "invalid-process-url")
+        .env("TOKEN", "wrong-process-token")
+        .env("DATA_PATH", "wrong-process-data")
+        .arg(format!("--url={}", server.url))
+        .arg("--token=test-token")
+        .arg(format!("--data-path={}", data.display()))
+        .output()
+        .unwrap();
+    assert_sync_success(&output);
+    assert_eq!(notes(&data).len(), 1);
+    assert!(!local.path().join("wrong-dotenv-data").exists());
+    assert!(!local.path().join("wrong-process-data").exists());
+}
+
+#[test]
+fn missing_flags_fall_back_to_environment_then_dotenv_for_each_setting() {
+    let server = Instance::new();
+    server.put("mixed", "mixed configuration");
+    for scenario in 0..3 {
+        let local = TempDir::new().unwrap();
+        fs::write(
+            local.path().join(".env"),
+            format!(
+                "MEMOS_URL={}\nTOKEN=test-token\nDATA_PATH=dotenv-data\n",
+                server.url
+            ),
+        )
+        .unwrap();
+        let mut command = command_without_config(&local);
+        let directory = match scenario {
+            0 => {
+                command
+                    .arg("--token=test-token")
+                    .env("TOKEN", "overridden-process-token")
+                    .env("MEMOS_URL", &server.url);
+                "dotenv-data"
+            }
+            1 => {
+                command
+                    .arg("--data-path=flag-data")
+                    .env("DATA_PATH", "overridden-process-data")
+                    .env("TOKEN", "test-token");
+                "flag-data"
+            }
+            _ => {
+                command
+                    .arg(format!("--url={}", server.url))
+                    .env("MEMOS_URL", "overridden-process-url")
+                    .env("DATA_PATH", "process-data");
+                "process-data"
+            }
+        };
+        let output = command.output().unwrap();
+        assert_sync_success(&output);
+        let downloaded = notes(&local.path().join(directory));
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(content(&downloaded[0]), "mixed configuration");
+    }
+}
+
+#[test]
+fn empty_configuration_flags_fail_instead_of_falling_back_to_valid_environment() {
+    let server = Instance::new();
+    let local = TempDir::new().unwrap();
+    server.put("untouched", "remote note");
+    for flag in ["--url=", "--token=", "--data-path="] {
+        let output = server.command(&local, "sync").arg(flag).output().unwrap();
+        assert!(!output.status.success(), "accepted empty flag {flag}");
+        assert!(!local.path().join("data").exists());
+    }
+    let db = server.db.lock().unwrap();
+    assert_eq!(db.creates, 0);
+    assert_eq!(db.updates, 0);
+    assert_eq!(db.memos.len(), 1);
+}

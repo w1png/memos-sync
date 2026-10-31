@@ -20,8 +20,9 @@ TOKEN="your-personal-access-token"
 DATA_PATH="./data"
 ```
 
-The app reads `.env` from the working directory; environment variables override
-its values. `DATA_PATH` defaults to `./data`. Keep your token private.
+The app reads `.env` from the working directory. Sync flags override environment
+variables, which override `.env` values. `DATA_PATH` defaults to `./data`.
+Keep your token private.
 
 ## Use
 
@@ -33,6 +34,7 @@ make install
 export PATH="$HOME/.local/bin:$PATH" # If this directory is not already on PATH.
 memos help
 memos sync
+memos sync --url=https://notes.example.com --token=your-token --data-path=./data
 ```
 
 `make` defaults to `make build`. Installation defaults to `~/.local/bin`; use
@@ -72,11 +74,12 @@ The default schedule is every five minutes; the second command changes it to
 every ten minutes. On Linux, install and enable your distribution's cron daemon
 first; this works on systems using systemd or OpenRC.
 
-Installation saves the current configuration and absolute notes path in a private
-launcher under `~/.local/state/memos/` (or `$XDG_STATE_HOME/memos/`). The job runs
-independently of the checkout's working directory. Run `make install-service`
-again after changing configuration. Use the same `PREFIX` for later management
-if you chose a custom install location.
+Service installation reads URL, token, and data path only from the current `.env`
+file. It saves a private launcher under `~/.local/state/memos/` (or
+`$XDG_STATE_HOME/memos/`) with explicit sync flags and an absolute notes path.
+Crontab calls the launcher; credentials stay in the private script. Run
+`make install-service` again after changing `.env` to update the saved job. Use
+the same `PREFIX` for later management if you chose a custom install location.
 
 ```sh
 make uninstall-service # Stop automatic syncing; keep the binary.

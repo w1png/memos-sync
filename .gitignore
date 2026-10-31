@@ -2,3 +2,4 @@
 /memos.log
 .env
 /data
+.DS_Store

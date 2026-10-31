@@ -6,10 +6,15 @@ mod sync;
 #[cfg(test)]
 mod sync_tests;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-const USAGE_GUIDE: &str = "Configuration (environment variables or .env in the current directory):
+const USAGE_GUIDE: &str =
+    "Configuration: command-line flags override environment variables, then .env.
+  memos sync --url=https://notes.example.com --token=TOKEN --data-path=./data
+
+Environment variables or .env in the current directory:
   MEMOS_URL   Your Memos instance URL (Memos 0.31.x)
   TOKEN       Your personal access token
   DATA_PATH   Local notes directory (default: ./data)
@@ -44,7 +49,17 @@ struct Cli {
 enum Command {
     /// Sync once (suitable for cron).
     #[command(after_help = USAGE_GUIDE)]
-    Sync,
+    Sync {
+        /// Memos instance URL (overrides MEMOS_URL).
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Personal access token (overrides TOKEN).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Local notes folder (overrides DATA_PATH; default: ./data).
+        #[arg(long, value_name = "PATH")]
+        data_path: Option<PathBuf>,
+    },
     /// Manage the per-user cron job through the Makefile.
     #[command(hide = true)]
     Service {
@@ -86,14 +101,11 @@ fn cycle(config: &config::Config) -> Result<i32> {
 fn execute() -> Result<i32> {
     match Cli::parse().command {
         Command::Service { command } => service::execute(command),
-        Command::Sync => {
-            match dotenvy::from_path(".env") {
-                Ok(_) => {}
-                Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("Cannot load .env"),
-            }
-            cycle(&config::Config::from_env()?)
-        }
+        Command::Sync {
+            url,
+            token,
+            data_path,
+        } => cycle(&config::Config::from_sources(url, token, data_path)?),
     }
 }
 
